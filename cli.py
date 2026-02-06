@@ -1,31 +1,24 @@
 # familybot/cli.py
-from __future__ import annotations
-
-import argparse
 import sys
+from typing import List
 
-from familybot import FamilyFinanceAgent, format_summary
+from familybot import FamilyFinanceAgent, format_summary_ar
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze family transactions.")
-    parser.add_argument("--members", nargs="+", required=True, help="Family member names")
-    parser.add_argument("--file", type=str, help="Path to a text file containing transactions")
-    parser.add_argument("--explain-ar", action="store_true", help="Print Arabic explanation")
-    args = parser.parse_args()
-
-    if args.file:
-        with open(args.file, "r", encoding="utf-8") as handle:
-            input_text = handle.read()
+def main(argv: List[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        text = sys.stdin.read()
     else:
-        input_text = sys.stdin.read()
-
-    agent = FamilyFinanceAgent(args.members)
-    analysis = agent.analyze(input_text)
-    print(format_summary(analysis))
-    if args.explain_ar:
-        print("\n" + agent.explain(analysis))
+        text = " ".join(argv)
+    members = ["Alex", "Jamie", "Sam"]
+    agent = FamilyFinanceAgent(members)
+    result = agent.analyze(text)
+    out = format_summary_ar(result, "ملخص من سطر الأوامر:")
+    sys.stdout.write(out + "\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
