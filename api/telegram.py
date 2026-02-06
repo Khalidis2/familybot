@@ -4,6 +4,7 @@ import asyncio
 from http.server import BaseHTTPRequestHandler
 
 from telegram import Update
+
 from familybot.bot import application
 
 
@@ -21,7 +22,6 @@ class handler(BaseHTTPRequestHandler):
             await application.process_update(update)
 
         asyncio.run(process())
-
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
