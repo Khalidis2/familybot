@@ -1,408 +1,330 @@
 # familybot/__init__.py
-from __future__ import annotations
-
+import os
+import math
 from dataclasses import dataclass, field
-import re
-from typing import Dict, Iterable, List, Tuple
-
-DEFAULT_CURRENCY = "AED"
-AMOUNT_PATTERN = re.compile(
-    r"(?P<currency>\$|€|USD|EUR|AED|Dh|Dirham|Dirhams|درهم|درهماً|درهم إماراتي)?\s*"
-    r"(?P<amount>[0-9٠-٩۰-۹][0-9٠-٩۰-۹.,٬]*)"
-)
-AED_INDICATORS = (
-    "aed",
-    "dh",
-    "dirham",
-    "dirhams",
-    "درهم",
-    "درهماً",
-    "درهم إماراتي",
-)
-ARABIC_DIGITS_MAP = str.maketrans(
-    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"
-)
-CATEGORY_KEYWORDS = [
-    (["rent", "إيجار", "سكن", "apartment"], "إيجار"),
-    (["electricity", "كهرباء"], "كهرباء"),
-    (["water", "ماء", "مياه"], "مياه"),
-    (["etisalat", "du", "اتصالات", "إنترنت", "internet"], "اتصالات"),
-    (["salik", "سالِك", "سالك"], "سالك"),
-    (["parking", "مواقف", "موقف"], "مواقف"),
-    (["grocery", "groceries", "بقالة", "سوبرماركت", "supermarket"], "بقالة"),
-    (["school", "education", "مدرسة", "رسوم مدرسة"], "مدرسة"),
-    (["loan", "قرض", "سلفة"], "قرض"),
-]
-
-
-def _normalize_name(name: str) -> str:
-    return re.sub(r"\s+", " ", name.strip()).title()
-
-
-def _normalize_number(value: str) -> str:
-    value = value.translate(ARABIC_DIGITS_MAP)
-    value = value.replace(",", "").replace("٬", "")
-    return value
-
-
-def _extract_amount(text: str) -> float | None:
-    match = AMOUNT_PATTERN.search(text)
-    if not match:
-        return None
-    normalized = _normalize_number(match.group("amount"))
-    return float(normalized)
-
-
-def _extract_amounts_with_currency(text: str) -> List[Tuple[float, str]]:
-    results: List[Tuple[float, str]] = []
-    for match in AMOUNT_PATTERN.finditer(text):
-        amount_text = _normalize_number(match.group("amount"))
-        amount = float(amount_text)
-        currency_hint = match.group("currency") or ""
-        currency = _detect_currency(currency_hint or text)
-        results.append((amount, currency))
-    return results
-
-
-def _detect_currency(text: str) -> str:
-    lower_text = text.lower()
-    if any(indicator in lower_text for indicator in AED_INDICATORS):
-        return "AED"
-    if "$" in text or "usd" in lower_text:
-        return "USD"
-    if "€" in text or "eur" in lower_text:
-        return "EUR"
-    return DEFAULT_CURRENCY
-
-
-def _find_members_in_text(text: str, members: Iterable[str]) -> List[str]:
-    found = []
-    lower_text = text.lower()
-    for member in members:
-        if member.lower() in lower_text:
-            found.append(member)
-    return found
+from typing import List, Dict, Any, Tuple
 
 
 @dataclass
-class Ledger:
-    debts: Dict[str, Dict[str, float]] = field(default_factory=dict)
-
-    def add_debt(self, debtor: str, creditor: str, amount: float) -> None:
-        if amount <= 0:
-            return
-        self.debts.setdefault(debtor, {})
-        self.debts[debtor][creditor] = self.debts[debtor].get(creditor, 0.0) + amount
-
-    def reduce_debt(self, debtor: str, creditor: str, amount: float) -> None:
-        if amount <= 0:
-            return
-        if debtor not in self.debts or creditor not in self.debts[debtor]:
-            return
-        self.debts[debtor][creditor] = max(self.debts[debtor][creditor] - amount, 0.0)
-
-    def totals(self, members: Iterable[str]) -> Dict[str, Dict[str, float]]:
-        totals: Dict[str, Dict[str, float]] = {}
-        for member in members:
-            owes = sum(self.debts.get(member, {}).values())
-            due = sum(
-                creditor_amounts.get(member, 0.0)
-                for creditor_amounts in self.debts.values()
-            )
-            totals[member] = {
-                "owes": round(owes, 2),
-                "due": round(due, 2),
-                "net": round(due - owes, 2),
-            }
-        return totals
-
-    def settle_suggestions(self) -> List[Tuple[str, str, float]]:
-        suggestions = []
-        for debtor, creditors in self.debts.items():
-            for creditor, amount in creditors.items():
-                if amount > 0:
-                    suggestions.append((debtor, creditor, round(amount, 2)))
-        return suggestions
+class MemberSummary:
+    paid: float = 0.0
+    consumed: float = 0.0
+    net: float = 0.0
+    owes: float = 0.0
+    due: float = 0.0
+    monthly_obligations: float = 0.0
 
 
 @dataclass
+class Transaction:
+    description: str
+    payer: str
+    amount: float
+    currency: str
+    beneficiaries: List[str]
+    shares: Dict[str, float]
+    category: str
+
+
 class FamilyFinanceAgent:
-    family_members: List[str]
+    def __init__(self, members: List[str], currency: str = "AED") -> None:
+        self.members = members
+        self.currency = currency
 
-    def __post_init__(self) -> None:
-        self.family_members = [_normalize_name(name) for name in self.family_members]
-
-    def analyze(self, text: str) -> Dict[str, object]:
-        ledger = Ledger()
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        detected_currencies = []
-        loans = []
-        monthly_obligations: Dict[str, float] = {}
-        transactions = []
-
-        for line in lines:
-            normalized_line = line.lower()
-            amount = _extract_amount(line)
-            if amount is None:
-                continue
-            currency = _detect_currency(line)
-            detected_currencies.append(currency)
-            category = self._categorize(line)
-            transactions.append(
-                {
-                    "text": line,
-                    "amount": amount,
-                    "currency": currency,
-                    "category": category,
-                }
-            )
-
-            if self._is_loan_line(normalized_line):
-                loan = self._parse_loan_line(line)
-                if loan:
-                    loans.append(loan)
-                    borrower = loan["borrower"]
-                    monthly_payment = loan["monthly_payment"]
-                    if monthly_payment:
-                        monthly_obligations[borrower] = (
-                            monthly_obligations.get(borrower, 0.0) + monthly_payment
-                        )
-                continue
-
-            if "owes" in normalized_line:
-                self._handle_owes(line, ledger, amount)
-                continue
-
-            if "reimbursed" in normalized_line or "paid back" in normalized_line:
-                self._handle_reimbursement(line, ledger, amount)
-                continue
-
-            if "paid" in normalized_line:
-                self._handle_payment(line, ledger, amount)
-
-        summary = ledger.totals(self.family_members)
-        for member in self.family_members:
-            summary.setdefault(member, {})
-            summary[member]["monthly_obligations"] = round(
-                monthly_obligations.get(member, 0.0), 2
-            )
-        suggestions = ledger.settle_suggestions()
-
-        paid_members = [member for member, data in summary.items() if data["due"] > 0]
-        unpaid_members = [
-            member for member, data in summary.items() if data["owes"] > 0
-        ]
-
-        currencies = sorted({currency for currency in detected_currencies if currency})
-        if not currencies:
-            currency = DEFAULT_CURRENCY
-        elif len(currencies) == 1:
-            currency = currencies[0]
-        else:
-            currency = "mixed"
-
-        return {
-            "summary": summary,
-            "settlement_suggestions": suggestions,
-            "paid_members": paid_members,
-            "unpaid_members": unpaid_members,
-            "currency": currency,
-            "loans": loans,
-            "transactions": transactions,
-        }
-
-    def _handle_owes(self, line: str, ledger: Ledger, amount: float) -> None:
-        parts = re.split(r"owes", line, flags=re.IGNORECASE)
-        if len(parts) < 2:
-            return
-        debtor_name = _normalize_name(parts[0])
-        creditor_candidates = _find_members_in_text(parts[1], self.family_members)
-        creditor_name = (
-            _normalize_name(creditor_candidates[0]) if creditor_candidates else "Unknown"
-        )
-        ledger.add_debt(debtor_name, creditor_name, amount)
-
-    def _handle_reimbursement(self, line: str, ledger: Ledger, amount: float) -> None:
-        words = line.split()
-        if not words:
-            return
-        debtor_name = _normalize_name(words[0])
-        creditor_candidates = _find_members_in_text(line, self.family_members)
-        creditor_name = (
-            _normalize_name(creditor_candidates[1]) if len(creditor_candidates) > 1 else "Unknown"
-        )
-        ledger.reduce_debt(debtor_name, creditor_name, amount)
-
-    def _handle_payment(self, line: str, ledger: Ledger, amount: float) -> None:
-        words = line.split()
-        if not words:
-            return
-        payer_name = _normalize_name(words[0])
-        beneficiaries = self._extract_beneficiaries(line)
-        if not beneficiaries:
-            beneficiaries = self.family_members
-        if not beneficiaries:
-            return
-        split_amount = round(amount / len(beneficiaries), 2)
-        for beneficiary in beneficiaries:
-            beneficiary = _normalize_name(beneficiary)
-            if beneficiary == payer_name:
-                continue
-            ledger.add_debt(beneficiary, payer_name, split_amount)
-
-    def _extract_beneficiaries(self, line: str) -> List[str]:
-        positions = [m.start() for m in re.finditer(r"\bfor\b", line, flags=re.IGNORECASE)]
-        if not positions:
-            return []
-        remainder = line[positions[-1] + len("for") :].strip()
-        if re.search(r"everyone|family|all", remainder, flags=re.IGNORECASE):
-            return list(self.family_members)
-        tokens = re.split(r",|and", remainder)
-        names = []
-        for token in tokens:
-            token = token.strip()
-            if not token:
-                continue
-            name_match = _find_members_in_text(token, self.family_members)
-            if name_match:
-                names.extend(name_match)
+    def analyze(self, text: str) -> Dict[str, Any]:
+        transactions, debts, loans = self._fallback_parse(text)
+        summary_members = {m: MemberSummary() for m in self.members}
+        for tx in transactions:
+            payer = tx.payer
+            amount = tx.amount
+            summary_members[payer].paid += amount
+            for b, share in tx.shares.items():
+                summary_members[b].consumed += share
+        for d in debts:
+            debtor = d["from"]
+            creditor = d["to"]
+            amount = d["amount"]
+            summary_members[debtor].net -= amount
+            summary_members[creditor].net += amount
+        for name, s in summary_members.items():
+            s.net += s.paid - s.consumed
+        settlements = self._compute_settlements(summary_members)
+        for name, s in summary_members.items():
+            if s.net < 0:
+                s.owes = round(-s.net, 2)
+                s.due = 0.0
+            elif s.net > 0:
+                s.due = round(s.net, 2)
+                s.owes = 0.0
             else:
-                names.append(token)
-        return names
+                s.owes = 0.0
+                s.due = 0.0
+            s.paid = round(s.paid, 2)
+            s.consumed = round(s.consumed, 2)
+            s.net = round(s.net, 2)
+        debts_from_settlements = [
+            {"from": s["from"], "to": s["to"], "amount": s["amount"]}
+            for s in settlements
+        ]
+        result = {
+            "transactions": [
+                {
+                    "description": tx.description,
+                    "payer": tx.payer,
+                    "amount": tx.amount,
+                    "currency": tx.currency,
+                    "beneficiaries": tx.beneficiaries,
+                    "shares": tx.shares,
+                    "category": tx.category,
+                }
+                for tx in transactions
+            ],
+            "loans": loans,
+            "summary": {
+                "members": {
+                    name: {
+                        "paid": s.paid,
+                        "consumed": s.consumed,
+                        "net": s.net,
+                        "owes": s.owes,
+                        "due": s.due,
+                        "monthly_obligations": round(
+                            s.monthly_obligations, 2
+                        ),
+                    }
+                    for name, s in summary_members.items()
+                },
+                "debts": debts_from_settlements,
+                "settlements": settlements,
+            },
+        }
+        return result
 
-    def _is_loan_line(self, normalized_line: str) -> bool:
-        return "loan" in normalized_line or "قرض" in normalized_line
+    def _fallback_parse(
+        self, text: str
+    ) -> Tuple[List[Transaction], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        transactions: List[Transaction] = []
+        debts: List[Dict[str, Any]] = []
+        loans: List[Dict[str, Any]] = []
+        for line in lines:
+            lower = line.lower()
+            tokens = lower.replace(".", "").split()
+            payer = None
+            amount = None
+            for name in self.members:
+                if name.lower() in lower and "paid" in tokens:
+                    payer = name
+                    break
+            if payer is not None:
+                amount = self._extract_number(lower)
+                if amount is not None:
+                    beneficiaries = [
+                        name
+                        for name in self.members
+                        if name != payer and name.lower() in lower
+                    ]
+                    if not beneficiaries:
+                        beneficiaries = [m for m in self.members if m != payer]
+                    share = round(amount / max(len(beneficiaries), 1), 2)
+                    shares = {b: share for b in beneficiaries}
+                    category = self._guess_category(lower)
+                    tx = Transaction(
+                        description=line,
+                        payer=payer,
+                        amount=amount,
+                        currency=self.currency,
+                        beneficiaries=beneficiaries,
+                        shares=shares,
+                        category=category,
+                    )
+                    transactions.append(tx)
+                    continue
+            debtor, creditor, amount = self._parse_owes_line(line)
+            if debtor and creditor and amount is not None:
+                debts.append(
+                    {
+                        "from": debtor,
+                        "to": creditor,
+                        "amount": round(amount, 2),
+                    }
+                )
+                continue
+            loan = self._parse_loan_line(line)
+            if loan is not None:
+                loans.append(loan)
+        return transactions, debts, loans
 
-    def _parse_loan_line(self, line: str) -> Dict[str, object] | None:
-        normalized = line.lower()
-        if not self._is_loan_line(normalized):
+    def _extract_number(self, s: str) -> float | None:
+        buf = []
+        for ch in s:
+            if ch.isdigit() or ch == ".":
+                buf.append(ch)
+            else:
+                buf.append(" ")
+        parts = [p for p in "".join(buf).split() if p]
+        for p in parts[::-1]:
+            try:
+                return float(p)
+            except ValueError:
+                continue
+        return None
+
+    def _guess_category(self, lower: str) -> str:
+        if "rent" in lower or "إيجار" in lower:
+            return "إيجار"
+        if "grocery" in lower or "بقالة" in lower or "سوبرماركت" in lower:
+            return "بقالة"
+        if "school" in lower or "رسوم" in lower or "مدرسة" in lower:
+            return "رسوم مدرسة"
+        if "salik" in lower or "سالك" in lower:
+            return "سالِك"
+        if "parking" in lower or "موقف" in lower or "مواقف" in lower:
+            return "مواقف"
+        if "electric" in lower or "كهرباء" in lower:
+            return "كهرباء"
+        if "water" in lower or "ماء" in lower or "مياه" in lower:
+            return "ماء"
+        if (
+            "etisalat" in lower
+            or "du" in lower.split()
+            or "اتصالات" in lower
+            or "إنترنت" in lower
+        ):
+            return "اتصالات"
+        if "loan" in lower or "قرض" in lower:
+            return "قرض"
+        return "غير مصنف"
+
+    def _parse_owes_line(
+        self, line: str
+    ) -> Tuple[str | None, str | None, float | None]:
+        lower = line.lower()
+        if "owes" not in lower and "مديون" not in lower:
+            return None, None, None
+        debtor = None
+        creditor = None
+        for name in self.members:
+            if name.lower() in lower and debtor is None:
+                debtor = name
+                break
+        if "owes" in lower:
+            after = lower.split("owes", 1)[1]
+            for name in self.members:
+                if name.lower() in after:
+                    creditor = name
+                    break
+        if "لـ" in line or "لى" in lower:
+            for name in self.members:
+                if name in line:
+                    if debtor is None:
+                        debtor = name
+                    elif creditor is None and name != debtor:
+                        creditor = name
+        amount = self._extract_number(lower)
+        if debtor and creditor and amount is not None:
+            return debtor, creditor, amount
+        return None, None, None
+
+    def _parse_loan_line(self, line: str) -> Dict[str, Any] | None:
+        lower = line.lower()
+        if "loan" not in lower and "قرض" not in lower:
             return None
-        borrower = self._extract_borrower(line)
-        lender = "Bank"
-        amounts = _extract_amounts_with_currency(line)
-        if not amounts:
+        borrower = None
+        for name in self.members:
+            if name.lower() in lower:
+                borrower = name
+                break
+        if borrower is None:
             return None
-        principal = amounts[0][0]
-        currency = amounts[0][1]
-        monthly_payment = amounts[1][0] if len(amounts) > 1 else None
-        if "monthly" not in normalized and "شهري" not in normalized:
-            monthly_payment = None
-        description = f"قرض حصل عليه {borrower} بمبلغ {principal:.2f} {currency}"
-        if monthly_payment:
-            description += f" مع دفعة شهرية {monthly_payment:.2f} {currency}"
-        return {
-            "description": description,
+        principal = self._extract_number(lower)
+        monthly_payment = None
+        if "month" in lower or "شهري" in lower or "شهرياً" in lower:
+            monthly_payment = self._extract_number(lower)
+        loan = {
+            "description": line,
             "borrower": borrower,
-            "lender": lender,
-            "principal": principal,
-            "currency": currency,
-            "monthly_payment": monthly_payment,
+            "lender": "البنك",
+            "principal": principal or 0.0,
+            "currency": self.currency,
+            "monthly_payment": monthly_payment or 0.0,
+            "months_total": None,
+            "months_paid": None,
+            "remaining_principal": None,
         }
+        return loan
 
-    def _extract_borrower(self, line: str) -> str:
-        tokens = line.split()
-        if not tokens:
-            return "Unknown"
-        if "took" in line.lower():
-            return _normalize_name(tokens[0])
-        if "أخذ" in line or "اخذ" in line:
-            return tokens[0]
-        return _normalize_name(tokens[0])
-
-    def explain(self, result: Dict[str, object]) -> str:
-        summary = result.get("summary", {})
-        suggestions = result.get("settlement_suggestions", [])
-        currency = result.get("currency", DEFAULT_CURRENCY)
-        lines = ["ملخص العائلة المالي:"]
-        for member, data in summary.items():
-            lines.append(
-                f"- {member}: مدفوع له {data['due']:.2f} {currency}، مديون {data['owes']:.2f} {currency}، "
-                f"صافي {data['net']:.2f} {currency}، الالتزامات الشهرية {data['monthly_obligations']:.2f} {currency}."
-            )
-        if suggestions:
-            lines.append("التسويات المقترحة:")
-            for debtor, creditor, amount in suggestions:
-                lines.append(
-                    f"- {debtor} يدفع لـ {creditor}: {amount:.2f} {currency}."
+    def _compute_settlements(
+        self, members: Dict[str, MemberSummary]
+    ) -> List[Dict[str, Any]]:
+        creditors: List[Tuple[str, float]] = []
+        debtors: List[Tuple[str, float]] = []
+        for name, s in members.items():
+            if s.net > 0.01:
+                creditors.append((name, s.net))
+            elif s.net < -0.01:
+                debtors.append((name, -s.net))
+        creditors.sort(key=lambda x: x[1], reverse=True)
+        debtors.sort(key=lambda x: x[1], reverse=True)
+        settlements: List[Dict[str, Any]] = []
+        i = 0
+        j = 0
+        while i < len(debtors) and j < len(creditors):
+            d_name, d_amt = debtors[i]
+            c_name, c_amt = creditors[j]
+            pay = min(d_amt, c_amt)
+            pay = round(pay, 2)
+            if pay > 0:
+                settlements.append(
+                    {"from": d_name, "to": c_name, "amount": pay}
                 )
-        return "\n".join(lines)
-
-    def format_arabic_summary(self, result: Dict[str, object], period_label: str) -> str:
-        summary = result.get("summary", {})
-        suggestions = result.get("settlement_suggestions", [])
-        loans = result.get("loans", [])
-        currency = result.get("currency", DEFAULT_CURRENCY)
-        obligations = {
-            member: data.get("monthly_obligations", 0.0)
-            for member, data in summary.items()
-            if data.get("monthly_obligations", 0.0) > 0
-        }
-        lines = [period_label]
-        lines.append("تفصيل الأفراد:")
-        for member, data in summary.items():
-            lines.append(
-                f"- {member}: المبلغ المدفوع {data['due']:.2f} {currency}، "
-                f"المبلغ المستفاد {data['owes']:.2f} {currency}، "
-                f"صافي الرصيد {data['net']:.2f} {currency}."
-            )
-        if suggestions:
-            lines.append("المديونيات:")
-            for debtor, creditor, amount in suggestions:
-                lines.append(f"- {debtor} مَدين لـ {creditor}: {amount:.2f} {currency}.")
-            lines.append("طريقة التسوية المقترحة:")
-            for debtor, creditor, amount in suggestions:
-                lines.append(f"- {debtor} يدفع لـ {creditor}: {amount:.2f} {currency}.")
-        if loans or obligations:
-            lines.append("القروض والالتزامات الشهرية:")
-            for loan in loans:
-                monthly = (
-                    f"، القسط الشهري {loan['monthly_payment']:.2f} {loan['currency']}"
-                    if loan.get("monthly_payment")
-                    else ""
-                )
-                lines.append(
-                    f"- {loan['borrower']}، الجهة المُقرضة {loan['lender']}، المبلغ {loan['principal']:.2f} {loan['currency']}{monthly}."
-                )
-            for member, amount in obligations.items():
-                lines.append(
-                    f"- التزام شهري لـ {member}: {amount:.2f} {currency}."
-                )
-        return "\n".join(lines)
-
-    def _categorize(self, line: str) -> str:
-        lowered = line.lower()
-        for keywords, category in CATEGORY_KEYWORDS:
-            if any(keyword.lower() in lowered for keyword in keywords):
-                return category
-        return "مصروفات عامة"
+            d_amt -= pay
+            c_amt -= pay
+            if d_amt <= 0.01:
+                i += 1
+            else:
+                debtors[i] = (d_name, d_amt)
+            if c_amt <= 0.01:
+                j += 1
+            else:
+                creditors[j] = (c_name, c_amt)
+        return settlements
 
 
-def format_summary(result: Dict[str, object]) -> str:
-    currency = result.get("currency", DEFAULT_CURRENCY)
-    lines = ["Family Finance Summary", "----------------------", f"Currency: {currency}"]
-    summary = result.get("summary", {})
-    for member, data in summary.items():
-        lines.append(
-            f"{member}: owes {data['owes']:.2f} {currency}, due {data['due']:.2f} {currency}, net {data['net']:.2f} {currency}"
-        )
-        lines.append(
-            f"{member}: monthly obligations {data['monthly_obligations']:.2f} {currency}"
-        )
-    suggestions = result.get("settlement_suggestions", [])
-    if suggestions:
-        lines.append("\nSettlement Suggestions")
-        for debtor, creditor, amount in suggestions:
-            lines.append(f"- {debtor} pays {creditor}: {amount:.2f} {currency}")
+def format_summary_ar(result: Dict[str, Any], period_label: str) -> str:
+    members = result["summary"]["members"]
+    settlements = result["summary"].get("settlements", [])
     loans = result.get("loans", [])
+    lines: List[str] = []
+    lines.append(period_label)
+    lines.append("")
+    lines.append("ملخص الأعضاء:")
+    for name, s in members.items():
+        paid = s["paid"]
+        consumed = s["consumed"]
+        net = s["net"]
+        lines.append(
+            f"- {name}: دفع {paid:.2f}، استفاد {consumed:.2f}، الصافي {net:.2f} درهم"
+        )
+    if settlements:
+        lines.append("")
+        lines.append("طريقة التسوية المقترحة:")
+        for s in settlements:
+            frm = s["from"]
+            to = s["to"]
+            amt = s["amount"]
+            lines.append(f"- {frm} يدفع {amt:.2f} درهماً إلى {to}")
+    else:
+        lines.append("")
+        lines.append("لا توجد مبالغ متبقية للتسوية بين الأعضاء.")
     if loans:
-        lines.append("\nLoans")
+        lines.append("")
+        lines.append("القروض والأقساط:")
         for loan in loans:
-            monthly = (
-                f", monthly {loan['monthly_payment']:.2f} {loan['currency']}"
-                if loan.get("monthly_payment")
-                else ""
-            )
+            borrower = loan["borrower"]
+            principal = loan["principal"]
+            monthly = loan["monthly_payment"]
             lines.append(
-                f"- {loan['borrower']} borrowed {loan['principal']:.2f} {loan['currency']} from {loan['lender']}{monthly}"
+                f"- {borrower}: قرض قدره {principal:.2f} درهم، قسط شهري {monthly:.2f} درهم"
             )
     return "\n".join(lines)
